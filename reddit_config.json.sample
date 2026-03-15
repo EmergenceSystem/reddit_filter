@@ -1,0 +1,11 @@
+{
+    "subreddits": [
+        "erlang",
+        "programming",
+        "linux",
+        "netsec",
+        "devops"
+    ],
+    "search_reddit": true,
+    "listing": "hot"
+}
