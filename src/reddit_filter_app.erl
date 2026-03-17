@@ -1,19 +1,21 @@
 %%%-------------------------------------------------------------------
 %%% @doc Reddit search agent using the public JSON API.
 %%%
-%%% Two search modes:
+%%% Two search modes running in parallel:
 %%%
 %%%   Subreddit listing — fetches hot/new posts from configured
-%%%                       subreddits and filters by query keyword.
-%%%                       No auth needed, just append .json to any
-%%%                       Reddit listing URL.
+%%%                       subreddits and filters by keyword.
 %%%
-%%%   Reddit search     — uses reddit.com/search.json?q=... to search
-%%%                       across all of Reddit (or restricted to
-%%%                       configured subreddits).
+%%%   Reddit search     — uses reddit.com/search.json to search
+%%%                       across all of Reddit or restricted to
+%%%                       configured subreddits.
 %%%
-%%% Both modes run in parallel. Deduplication by URL is handled
-%%% upstream by emquest_handler.
+%%% Deduplication by URL is handled upstream by the Emquest pipeline.
+%%%
+%%% === Capability cascade ===
+%%%
+%%%   base_capabilities/0 extends em_filter:base_capabilities().
+%%%   Topic-specific filters extend reddit_filter_app:base_capabilities():
 %%%
 %%% reddit_config.json format:
 %%%   {
@@ -24,25 +26,25 @@
 %%%
 %%% listing can be: "hot" | "new" | "top" | "rising"
 %%%
-%%% Handler contract: handle/2 (Body, Memory) -> {RawList, NewMemory}.
-%%% Memory schema: #{seen => #{binary_url => true}}.
+%%% Handler contract: handle/2 (Body, Memory) -> {RawList, Memory}.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(reddit_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/2]).
+-export([handle/2, base_capabilities/0]).
 
-%% Reddit requires a descriptive User-Agent or it returns 429.
 -define(USER_AGENT, "EmergenceSystem/1.0 (em_filter reddit agent)").
 
--define(CAPABILITIES, [
-    <<"reddit">>,
-    <<"community">>,
-    <<"news">>,
-    <<"programming">>
-]).
+%%====================================================================
+%% Capability cascade
+%%====================================================================
+
+-spec base_capabilities() -> [binary()].
+base_capabilities() ->
+    em_filter:base_capabilities() ++ [<<"reddit">>, <<"community">>,
+                                      <<"news">>, <<"programming">>].
 
 %%====================================================================
 %% Application behaviour
@@ -50,8 +52,7 @@
 
 start(_StartType, _StartArgs) ->
     em_filter:start_agent(reddit_filter, ?MODULE, #{
-        capabilities => ?CAPABILITIES,
-        memory       => ets
+        capabilities => base_capabilities()
     }).
 
 stop(_State) ->
@@ -62,14 +63,7 @@ stop(_State) ->
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
-    Seen    = maps:get(seen, Memory, #{}),
-    Embryos = generate_embryo_list(Body),
-    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
-    NewSeen = lists:foldl(fun(E, Acc) ->
-        Acc#{url_of(E) => true}
-    end, Seen, Fresh),
-    {Fresh, Memory#{seen => NewSeen}};
-
+    {generate_embryo_list(Body), Memory};
 handle(_Body, Memory) ->
     {[], Memory}.
 
@@ -85,13 +79,11 @@ generate_embryo_list(JsonBinary) ->
     Listing    = binary_to_list(maps:get(<<"listing">>, Config, <<"hot">>)),
     Parent     = self(),
 
-    %% Spawn subreddit listing searches in parallel.
     SubPids = [spawn(fun() ->
         Parent ! {sub_result, Sub,
                   search_subreddit(Sub, Listing, Value, Timeout)}
     end) || Sub <- Subreddits],
 
-    %% Spawn global Reddit search if enabled.
     SearchPid = case DoSearch andalso Value =/= "" of
         true ->
             Pid = spawn(fun() ->
@@ -104,7 +96,6 @@ generate_embryo_list(JsonBinary) ->
 
     DeadlineMs = erlang:system_time(millisecond) + Timeout * 1000,
 
-    %% Collect subreddit results.
     SubResults = lists:flatmap(fun(_) ->
         Remaining = max(0, DeadlineMs - erlang:system_time(millisecond)),
         receive
@@ -113,7 +104,6 @@ generate_embryo_list(JsonBinary) ->
         end
     end, SubPids),
 
-    %% Collect global search results.
     SearchResults = case SearchPid of
         [] -> [];
         _  ->
@@ -161,7 +151,6 @@ read_config() ->
 %% Subreddit listing search
 %%====================================================================
 
-%% Fetches the listing for a subreddit and filters posts by keyword.
 search_subreddit(Sub, Listing, Query, TimeoutSecs) ->
     SubStr = binary_to_list(Sub),
     Url    = lists:concat(["https://www.reddit.com/r/", SubStr, "/",
@@ -178,7 +167,6 @@ search_subreddit(Sub, Listing, Query, TimeoutSecs) ->
 %% Global Reddit search
 %%====================================================================
 
-%% Uses Reddit's search endpoint, optionally restricted to subreddits.
 search_global(Query, Subreddits, TimeoutSecs) ->
     Restrict = case Subreddits of
         [] -> "";
@@ -192,8 +180,9 @@ search_global(Query, Subreddits, TimeoutSecs) ->
                          Restrict]),
     case fetch_json(Url, TimeoutSecs) of
         {ok, #{<<"data">> := #{<<"children">> := Posts}}} ->
-            lists:filtermap(fun(P) -> process_post(P, string:lowercase(Query)) end,
-                            Posts);
+            lists:filtermap(
+                fun(P) -> process_post(P, string:lowercase(Query)) end,
+                Posts);
         _ ->
             []
     end.
@@ -231,7 +220,6 @@ process_post(_, _) -> false.
 %% HTTP helper
 %%====================================================================
 
-%% Reddit requires a User-Agent header or returns 429 Too Many Requests.
 fetch_json(Url, TimeoutSecs) ->
     Headers = [{"User-Agent", ?USER_AGENT}],
     case httpc:request(get, {Url, Headers},
@@ -240,10 +228,8 @@ fetch_json(Url, TimeoutSecs) ->
         {ok, {{_, 200, _}, _, Body}} ->
             try {ok, json:decode(Body)}
             catch _:_ -> {error, invalid_json} end;
-        {ok, {{_, Code, _}, _, _}} ->
-            {error, {http, Code}};
-        {error, R} ->
-            {error, R}
+        {ok, {{_, Code, _}, _, _}} -> {error, {http, Code}};
+        {error, R}                 -> {error, R}
     end.
 
 %%====================================================================
@@ -255,7 +241,3 @@ fmt(F, Args) ->
 
 to_str(B) when is_binary(B) -> binary_to_list(B);
 to_str(_)                   -> "".
-
--spec url_of(map()) -> binary().
-url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
-url_of(_) -> <<>>.
