@@ -30,9 +30,7 @@
 %%% @end
 %%%-------------------------------------------------------------------
 -module(reddit_filter_app).
--behaviour(application).
 
--export([start/2, stop/1]).
 -export([handle/2, base_capabilities/0]).
 
 -define(USER_AGENT, "EmergenceSystem/1.0 (em_filter reddit agent)").
@@ -45,19 +43,6 @@
 base_capabilities() ->
     em_filter:base_capabilities() ++ [<<"reddit">>, <<"community">>,
                                       <<"news">>, <<"programming">>].
-
-%%====================================================================
-%% Application behaviour
-%%====================================================================
-
-start(_StartType, _StartArgs) ->
-    em_filter:start_agent(reddit_filter, ?MODULE, #{
-        capabilities => base_capabilities()
-    }),
-    {ok, self()}.
-
-stop(_State) ->
-    em_filter:stop_agent(reddit_filter).
 
 %%====================================================================
 %% Agent handler
