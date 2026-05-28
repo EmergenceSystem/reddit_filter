@@ -1,6 +1,6 @@
 {application, reddit_filter, [
     {description, "em_filter lib to search Reddit via the public JSON API"},
-    {vsn, "0.2.3"},
+    {vsn, "0.2.4"},
     {registered, []},
     {applications, [
         kernel,
