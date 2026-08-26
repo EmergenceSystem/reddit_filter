@@ -1,30 +1,17 @@
 %%%-------------------------------------------------------------------
-%%% @doc Reddit search agent using the public JSON API.
+%%% @doc Reddit search agent using public RSS/Atom feeds.
 %%%
-%%% Two search modes running in parallel:
+%%% The Reddit JSON API now returns 403/429 for unauthenticated clients,
+%%% but the per-subreddit Atom feeds (/r/<sub>/<listing>.rss) still serve
+%%% without OAuth. This agent fetches those feeds for a set of configured
+%%% subreddits and keyword-filters the entries.
 %%%
-%%%   Subreddit listing — fetches hot/new posts from configured
-%%%                       subreddits and filters by keyword.
+%%% Global /search.rss is rate-limited (429) and therefore not used;
+%%% coverage comes from the subreddit listings instead.
 %%%
-%%%   Reddit search     — uses reddit.com/search.json to search
-%%%                       across all of Reddit or restricted to
-%%%                       configured subreddits.
-%%%
-%%% Deduplication by URL is handled upstream by the Emquest pipeline.
-%%%
-%%% === Capability cascade ===
-%%%
-%%%   base_capabilities/0 extends em_filter:base_capabilities().
-%%%   Topic-specific filters extend reddit_filter_app:base_capabilities():
-%%%
-%%% reddit_config.json format:
-%%%   {
-%%%     "subreddits": ["erlang", "programming", "linux"],
-%%%     "search_reddit": true,
-%%%     "listing": "hot"
-%%%   }
-%%%
-%%% listing can be: "hot" | "new" | "top" | "rising"
+%%% reddit_config.json (optional, read from CWD):
+%%%   { "subreddits": ["rust","erlang"], "listing": "hot" }
+%%%   listing can be: hot | new | top | rising
 %%%
 %%% Handler contract: handle/2 (Body, Memory) -> {RawList, Memory}.
 %%% @end
@@ -33,74 +20,73 @@
 
 -export([handle/2, base_capabilities/0]).
 
--define(USER_AGENT, "EmergenceSystem/1.0 (em_filter reddit agent)").
-
-%%====================================================================
-%% Capability cascade
-%%====================================================================
+-define(FEED_TTL, 120).  %% seconds
+-define(UA, "Mozilla/5.0 (X11; Linux aarch64; rv:128.0) Gecko/20100101 Firefox/128.0").
+-define(DEFAULT_SUBS, [<<"programming">>, <<"rust">>, <<"erlang">>,
+                       <<"linux">>, <<"technology">>, <<"science">>,
+                       <<"worldnews">>, <<"news">>]).
 
 -spec base_capabilities() -> [binary()].
 base_capabilities() ->
     em_filter:base_capabilities() ++ [<<"reddit">>, <<"community">>,
                                       <<"news">>, <<"programming">>].
 
-%%====================================================================
-%% Agent handler
-%%====================================================================
-
 handle(Body, Memory) when is_binary(Body) ->
-    {generate_embryo_list(Body), Memory};
+    {Value, Timeout} = extract_params(Body),
+    Config     = read_config(),
+    Subreddits = case maps:get(<<"subreddits">>, Config, []) of
+                     []   -> ?DEFAULT_SUBS;
+                     Subs -> Subs
+                 end,
+    Listing    = binary_to_list(maps:get(<<"listing">>, Config, <<"hot">>)),
+    LQuery     = string:lowercase(Value),
+    Feeds0     = case Memory of M when is_map(M) -> maps:get(feeds, M, #{}); _ -> #{} end,
+    Feeds1     = refresh_feeds(Subreddits, Listing, Timeout, Feeds0),
+    Results    = lists:flatmap(fun(Sub) ->
+                     case maps:get({Sub, Listing}, Feeds1, undefined) of
+                         {_Ts, Xml} ->
+                             lists:filtermap(
+                               fun(E) -> match_entry(E, Sub, LQuery) end,
+                               parse_entries(Xml));
+                         _ -> []
+                     end
+                 end, Subreddits),
+    Mem1 = case Memory of MM when is_map(MM) -> MM; _ -> #{} end,
+    {Results, Mem1#{feeds => Feeds1}};
 handle(_Body, Memory) ->
     {[], Memory}.
 
-%%====================================================================
-%% Aggregation — subreddit listing + global search in parallel
-%%====================================================================
-
-generate_embryo_list(JsonBinary) ->
-    {Value, Timeout} = extract_params(JsonBinary),
-    Config     = read_config(),
-    Subreddits = maps:get(<<"subreddits">>,    Config, []),
-    DoSearch   = maps:get(<<"search_reddit">>, Config, true),
-    Listing    = binary_to_list(maps:get(<<"listing">>, Config, <<"hot">>)),
-    Parent     = self(),
-
-    SubPids = [spawn(fun() ->
-        Parent ! {sub_result, Sub,
-                  search_subreddit(Sub, Listing, Value, Timeout)}
-    end) || Sub <- Subreddits],
-
-    SearchPid = case DoSearch andalso Value =/= "" of
-        true ->
-            Pid = spawn(fun() ->
-                Parent ! {search_result,
-                          search_global(Value, Subreddits, Timeout)}
-            end),
-            [Pid];
-        false -> []
-    end,
-
+%% TTL cache: fetch only subreddits whose cached feed is missing or older
+%% than ?FEED_TTL seconds. Stale fetches run in parallel; fresh ones are
+%% reused from Memory. This keeps request volume low enough to avoid
+%% Reddit rate-limiting (HTTP 429).
+refresh_feeds(Subreddits, Listing, Timeout, Feeds0) ->
+    Now  = erlang:system_time(second),
+    Stale = [Sub || Sub <- Subreddits,
+                    is_stale(maps:get({Sub, Listing}, Feeds0, undefined), Now)],
+    Parent = self(),
+    Pids = [spawn(fun() ->
+                Parent ! {feed, self(), Sub, fetch(feed_url(Sub, Listing), Timeout)}
+            end) || Sub <- Stale],
     DeadlineMs = erlang:system_time(millisecond) + Timeout * 1000,
-
-    SubResults = lists:flatmap(fun(_) ->
+    lists:foldl(fun(_, Acc) ->
         Remaining = max(0, DeadlineMs - erlang:system_time(millisecond)),
         receive
-            {sub_result, _Sub, Results} -> Results
-        after Remaining -> []
+            {feed, _Pid, Sub, {ok, Xml}} ->
+                Acc#{{Sub, Listing} => {Now, Xml}};
+            {feed, _Pid, _Sub, _Err} ->
+                Acc
+        after Remaining -> Acc
         end
-    end, SubPids),
+    end, Feeds0, Pids).
 
-    SearchResults = case SearchPid of
-        [] -> [];
-        _  ->
-            Remaining = max(0, DeadlineMs - erlang:system_time(millisecond)),
-            receive
-                {search_result, Results} -> Results
-            after Remaining -> []
-            end
-    end,
+is_stale(undefined, _Now) -> true;
+is_stale({Ts, _Xml}, Now) -> (Now - Ts) > ?FEED_TTL;
+is_stale(_, _)            -> true.
 
-    SubResults ++ SearchResults.
+feed_url(Sub, Listing) ->
+    lists:concat(["https://www.reddit.com/r/", binary_to_list(Sub), "/",
+                  Listing, ".rss?limit=50"]).
 
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
@@ -119,10 +105,6 @@ extract_params(JsonBinary) ->
         _:_ -> {binary_to_list(JsonBinary), 10}
     end.
 
-%%--------------------------------------------------------------------
-%% Config
-%%--------------------------------------------------------------------
-
 read_config() ->
     case file:read_file("reddit_config.json") of
         {ok, Bin} ->
@@ -133,97 +115,117 @@ read_config() ->
         _ -> #{}
     end.
 
-%%====================================================================
-%% Subreddit listing search
-%%====================================================================
-
-search_subreddit(Sub, Listing, Query, TimeoutSecs) ->
-    SubStr = binary_to_list(Sub),
-    Url    = lists:concat(["https://www.reddit.com/r/", SubStr, "/",
-                            Listing, ".json?limit=50"]),
-    case fetch_json(Url, TimeoutSecs) of
-        {ok, #{<<"data">> := #{<<"children">> := Posts}}} ->
-            LQuery = string:lowercase(Query),
-            lists:filtermap(fun(P) -> process_post(P, LQuery) end, Posts);
-        _ ->
-            []
+parse_entries(Xml) ->
+    case binary:split(Xml, <<"<entry>">>, [global]) of
+        [_Head | Rest] -> [entry_block(P) || P <- Rest];
+        _              -> []
     end.
 
-%%====================================================================
-%% Global Reddit search
-%%====================================================================
+entry_block(P) ->
+    Block = case binary:split(P, <<"</entry>">>) of
+                [B | _] -> B;
+                _       -> P
+            end,
+    Title   = between(Block, <<"<title>">>, <<"</title>">>),
+    Content = content_html(Block),
+    Link    = link_href(Block),
+    #{title => unescape(strip_cdata(Title)),
+      link  => Link,
+      body  => unescape(strip_cdata(Content))}.
 
-search_global(Query, Subreddits, TimeoutSecs) ->
-    Restrict = case Subreddits of
-        [] -> "";
-        _  ->
-            Subs = string:join([binary_to_list(S) || S <- Subreddits], "+"),
-            "&restrict_sr=true&sr_name=" ++ Subs
-    end,
-    Url = lists:concat(["https://www.reddit.com/search.json?q=",
-                         uri_string:quote(Query),
-                         "&sort=relevance&limit=25",
-                         Restrict]),
-    case fetch_json(Url, TimeoutSecs) of
-        {ok, #{<<"data">> := #{<<"children">> := Posts}}} ->
-            lists:filtermap(
-                fun(P) -> process_post(P, string:lowercase(Query)) end,
-                Posts);
-        _ ->
-            []
+between(Bin, A, B) ->
+    case binary:split(Bin, A) of
+        [_, Rest] ->
+            case binary:split(Rest, B) of
+                [Mid | _] -> Mid;
+                _         -> <<>>
+            end;
+        _ -> <<>>
     end.
 
-%%====================================================================
-%% Post processing
-%%====================================================================
+content_html(Block) ->
+    case binary:split(Block, <<"<content">>) of
+        [_, Rest] ->
+            case binary:split(Rest, <<">">>) of
+                [_Attrs, After] -> between2(After, <<"</content>">>);
+                _               -> <<>>
+            end;
+        _ -> <<>>
+    end.
 
-process_post(#{<<"data">> := Post}, Query) ->
-    Title     = to_str(maps:get(<<"title">>,    Post, <<>>)),
-    Selftext  = to_str(maps:get(<<"selftext">>, Post, <<>>)),
-    Permalink = maps:get(<<"permalink">>,       Post, <<>>),
-    Score     = maps:get(<<"score">>,           Post, 0),
-    Sub       = maps:get(<<"subreddit">>,       Post, <<>>),
-    Comments  = maps:get(<<"num_comments">>,    Post, 0),
-    Url       = <<"https://www.reddit.com", Permalink/binary>>,
-    Matches   =
-        string:str(string:lowercase(Title),    Query) > 0 orelse
-        string:str(string:lowercase(Selftext), Query) > 0,
-    case Matches of
+between2(Bin, B) ->
+    case binary:split(Bin, B) of
+        [Mid | _] -> Mid;
+        _         -> Bin
+    end.
+
+link_href(Block) ->
+    case binary:split(Block, <<"<link href=\"">>) of
+        [_, Rest] ->
+            case binary:split(Rest, <<"\"">>) of
+                [Url | _] -> unescape(Url);
+                _         -> <<>>
+            end;
+        _ -> <<>>
+    end.
+
+strip_cdata(B) ->
+    B1 = case binary:split(B, <<"<![CDATA[">>) of
+             [_, R] -> R;
+             _      -> B
+         end,
+    case binary:split(B1, <<"]]>">>) of
+        [M, _] -> M;
+        _      -> B1
+    end.
+
+unescape(B) ->
+    L = [{<<"&amp;">>, <<"&">>}, {<<"&lt;">>, <<"<">>},
+         {<<"&gt;">>, <<">">>}, {<<"&quot;">>, <<"\"">>},
+         {<<"&#39;">>, <<"'">>}, {<<"&#x27;">>, <<"'">>}],
+    lists:foldl(fun({A, R}, Acc) ->
+        binary:replace(Acc, A, R, [global])
+    end, B, L).
+
+match_entry(#{title := Title, link := Link, body := Body}, Sub, LQuery) ->
+    Hay = string:lowercase(binary_to_list(<<Sub/binary, " ", Title/binary, " ", Body/binary>>)),
+    Matches = LQuery =:= "" orelse string:str(Hay, LQuery) > 0,
+    case Matches andalso Link =/= <<>> of
         true ->
-            Resume = fmt("r/~ts — ~ts [~p pts | ~p comments]",
-                         [Sub, Title, Score, Comments]),
+            Snippet = snippet(Body),
+            Resume  = fmt("r/~ts - ~ts~ts", [Sub, Title, Snippet]),
             {true, #{<<"properties">> => #{
-                <<"url">>    => Url,
-                <<"title">>  => unicode:characters_to_binary(Title),
+                <<"url">>    => Link,
+                <<"title">>  => Title,
                 <<"resume">> => Resume
             }}};
         false ->
             false
     end;
-process_post(_, _) -> false.
+match_entry(_, _, _) -> false.
 
-%%====================================================================
-%% HTTP helper
-%%====================================================================
+snippet(Body) ->
+    NoTags  = re:replace(Body, <<"<[^>]*>">>, <<" ">>, [global, {return, binary}]),
+    Clean   = re:replace(NoTags, <<"\s+">>, <<" ">>, [global, {return, binary}]),
+    Trimmed = string:trim(Clean),
+    case byte_size(Trimmed) of
+        0 -> <<>>;
+        _ ->
+            Cut = binary:part(Trimmed, 0, min(160, byte_size(Trimmed))),
+            <<" - ", Cut/binary>>
+    end.
 
-fetch_json(Url, TimeoutSecs) ->
-    Headers = [{"User-Agent", ?USER_AGENT}],
+fetch(Url, TimeoutSecs) ->
+    _ = application:ensure_all_started(ssl),
+    _ = application:ensure_all_started(inets),
+    Headers = [{"User-Agent", ?UA}, {"Accept", "application/atom+xml, text/xml"}],
     case httpc:request(get, {Url, Headers},
                        [{timeout, TimeoutSecs * 1000}],
                        [{body_format, binary}]) of
-        {ok, {{_, 200, _}, _, Body}} ->
-            try {ok, json:decode(Body)}
-            catch _:_ -> {error, invalid_json} end;
-        {ok, {{_, Code, _}, _, _}} -> {error, {http, Code}};
-        {error, R}                 -> {error, R}
+        {ok, {{_, 200, _}, _, Body}} -> {ok, Body};
+        {ok, {{_, Code, _}, _, _}}   -> {error, {http, Code}};
+        {error, R}                   -> {error, R}
     end.
-
-%%====================================================================
-%% Internal helpers
-%%====================================================================
 
 fmt(F, Args) ->
     unicode:characters_to_binary(io_lib:format(F, Args)).
-
-to_str(B) when is_binary(B) -> binary_to_list(B);
-to_str(_)                   -> "".
